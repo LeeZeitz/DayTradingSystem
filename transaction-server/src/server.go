@@ -8,9 +8,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-redis/redis"
 	_ "github.com/herenow/go-crate"
+	"github.com/streadway/amqp"
 )
 
 var (
@@ -42,93 +44,32 @@ var (
 		Password: "",
 		DB:       0,
 	})
+	auditmq   *amqp.Channel
+	ucQueue   amqp.Queue
+	qseQueue  amqp.Queue
+	atQueue   amqp.Queue
+	seQueue   amqp.Queue
+	auditChan = make(chan interface{})
 )
 
 func logSystemEvent(transactionNum int, server string, command string, username string, stock string, filename string, funds float64) {
-	req := struct {
-		TransactionNum int
-		Server         string
-		Command        string
-		Username       string
-		Stock          string
-		Filename       string
-		Funds          float64
-	}{transactionNum, server, command, username, stock, "", funds}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logSystemEvent", "application/json; charset=utf-8", b)
-	if err != nil {
-
-		failGracefully(err, "Failed to log system event")
-	}
-	defer r.Body.Close()
+	req := SystemEvent{TransactionNum: transactionNum, Server: server, Command: command, Username: username, Stock: stock, Filename: filename, Funds: funds}
+	auditChan <- req
 }
 
 func logUserCommand(transactionNum int, server string, command string, username string, stock string, filename string, funds float64) {
-	req := struct {
-		TransactionNum int
-		Server         string
-		Command        string
-		Username       string
-		Stock          string
-		Filename       string
-		Funds          float64
-	}{transactionNum, server, command, username, stock, "", funds}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logUserCommand", "application/json; charset=utf-8", b)
-
-	for err != nil {
-
-		r, err = http.Post(auditServer+"/logUserCommand", "application/json; charset=utf-8", b)
-
-		failGracefully(err, "Failed to log user command")
-	}
-	defer r.Body.Close()
+	req := UserCommand{TransactionNum: transactionNum, Server: server, Command: command, Username: username, Stock: stock, Filename: filename, Funds: funds}
+	auditChan <- req
 }
 
 func logAccountTransaction(transactionNum int, server string, action string, username string, funds float64) {
-	req := struct {
-		TransactionNum int
-		Server         string
-		Action         string
-		Username       string
-		Funds          float64
-	}{transactionNum, server, action, username, funds}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logAccountTransaction", "application/json; charset=utf-8", b)
-	if err != nil {
-
-		failGracefully(err, "Failed to log account transaction")
-	}
-
-	defer r.Body.Close()
+	req := AccountTransaction{TransactionNum: transactionNum, Server: server, Action: action, Username: username, Funds: funds}
+	auditChan <- req
 }
 
 func logQuoteServer(transactionNum int, server string, username string, stock string, cryptoKey string, quoteServerTime int64, price float64) {
-	req := struct {
-		TransactionNum  int
-		Server          string
-		Username        string
-		Stock           string
-		CryptoKey       string
-		QuoteServerTime int64
-		Price           float64
-	}{transactionNum, server, username, stock, cryptoKey, quoteServerTime, price}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logQuoteServer", "application/json; charset=utf-8", b)
-	if err != nil {
-
-		failGracefully(err, "Failed to log quote server event")
-	}
-
-	defer r.Body.Close()
+	req := QuoteServerEvent{TransactionNum: transactionNum, Server: server, Username: username, Stock: stock, CryptoKey: cryptoKey, QuoteServerTime: quoteServerTime, Price: price}
+	auditChan <- req
 }
 
 // Tested
@@ -797,7 +738,93 @@ func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Origin", "*")
 }
 
+func audit(audits <-chan interface{}) {
+	channelName := ""
+	for audit := range audits {
+		
+		switch audit.(type) {
+		case UserCommand:
+			channelName = "uc"
+		case AccountTransaction:
+			channelName = "at"
+		case QuoteServerEvent:
+			channelName = "qse"
+		case SystemEvent:
+			channelName = "se"
+		}
+		body, err := json.Marshal(audit)
+		failOnError(err, "Failed to marshall data")
+		err = auditmq.Publish(
+			"",          // exchange
+			channelName, // routing key
+			false,       // mandatory
+			false,       // immediate
+			amqp.Publishing{
+				ContentType:     "application/json",
+				ContentEncoding: "",
+				Body:            []byte(body),
+			})
+		failOnError(err, "Failed to publish a "+channelName+" message")
+	}
+}
+
+func initRabbit() {
+	conn, err := amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+	for err != nil {
+		conn, err = amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+		fmt.Println(err)
+		time.Sleep(time.Duration(5) * time.Second)
+	}
+	failOnError(err, "Failed to connect to RabbitMQ")
+
+	auditmq, err = conn.Channel()
+	failOnError(err, "Failed to open a channel")
+
+	ucQueue, err = auditmq.QueueDeclare(
+		"uc",  // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	qseQueue, err = auditmq.QueueDeclare(
+		"qse", // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	seQueue, err = auditmq.QueueDeclare(
+		"se",  // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	atQueue, err = auditmq.QueueDeclare(
+		"at",  // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+}
+
 func main() {
+	initRabbit()
+	defer auditmq.Close()
+	go audit(auditChan)
 	port := ":8080"
 	http.HandleFunc("/add", addHandler)
 	http.HandleFunc("/quote", quoteHandler)

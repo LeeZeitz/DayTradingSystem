@@ -12,6 +12,7 @@ import (
 	"time"
 
 	_ "github.com/herenow/go-crate"
+	"github.com/streadway/amqp"
 )
 
 var (
@@ -163,169 +164,368 @@ type LogType interface {
 	GetTransactionNum() int
 }
 
-func logUserCommandHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		TransactionNum int
-		Server         string
-		Command        string
-		Username       string
-		Stock          string
-		Filename       string
-		Funds          float64
-	}{0, "", "", "", "", "", 0.0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse the request")
-
-	queryString := "INSERT INTO user_commands (command, filename, funds, server, stock, timestamp, transaction_num, user_id)" +
-		" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-
-	timestamp := createTimestamp()
-
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare user command log query")
-
-	res, err := stmt.Exec(req.Command, req.Filename, req.Funds, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
-	failOnError(err, "Failed to add user command log")
-
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failOnError(err, "Failed to add user command log")
+func logUserCommandHandler() {
+	conn, err := amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+	for err != nil {
+		conn, err = amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+		fmt.Println(err)
+		time.Sleep(time.Duration(5) * time.Second)
 	}
+	failOnError(err, "Failed to connect to RabbitMQ")
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		"uc",  // name
+		false, // durable
+		false, // delete when usused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	failOnError(err, "Failed to register a consumer")
+
+	forever := make(chan bool)
+
+	go func() {
+		for d := range msgs {
+
+			req := struct {
+				TransactionNum int
+				Server         string
+				Command        string
+				Username       string
+				Stock          string
+				Filename       string
+				Funds          float64
+			}{0, "", "", "", "", "", 0.0}
+			err := json.Unmarshal(d.Body, &req)
+			failOnError(err, "Failed to parse the request")
+
+			queryString := "INSERT INTO user_commands (command, filename, funds, server, stock, timestamp, transaction_num, user_id)" +
+				" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+
+			timestamp := createTimestamp()
+
+			stmt, err := db.Prepare(queryString)
+			failOnError(err, "Failed to prepare user command log query")
+
+			res, err := stmt.Exec(req.Command, req.Filename, req.Funds, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
+			failOnError(err, "Failed to add user command log")
+
+			numrows, err := res.RowsAffected()
+			if numrows < 1 {
+				failOnError(err, "Failed to add user command log")
+			}
+		}
+	}()
+
+	log.Printf(" [*] Waiting for user commands.")
+	<-forever
 
 }
 
-func logSystemEventHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		TransactionNum int
-		Server         string
-		Command        string
-		Username       string
-		Stock          string
-		Filename       string
-		Funds          float64
-	}{0, "", "", "", "", "", 0.0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse the request")
-
-	queryString := "INSERT INTO system_events (command, filename, funds, server, stock, timestamp, transaction_num, user_id)" +
-		" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-
-	timestamp := createTimestamp()
-
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare system event log query")
-
-	res, err := stmt.Exec(req.Command, req.Filename, req.Funds, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
-	failOnError(err, "Failed to add system event log")
-
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failOnError(err, "Failed to add system event log")
+func logSystemEventHandler() {
+	conn, err := amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+	for err != nil {
+		conn, err = amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+		fmt.Println(err)
+		time.Sleep(time.Duration(5) * time.Second)
 	}
+	failOnError(err, "Failed to connect to RabbitMQ")
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		"se",  // name
+		false, // durable
+		false, // delete when usused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	failOnError(err, "Failed to register a consumer")
+
+	forever := make(chan bool)
+
+	go func() {
+		for d := range msgs {
+			req := struct {
+				TransactionNum int
+				Server         string
+				Command        string
+				Username       string
+				Stock          string
+				Filename       string
+				Funds          float64
+			}{0, "", "", "", "", "", 0.0}
+			err := json.Unmarshal(d.Body, &req)
+			failOnError(err, "Failed to parse the request")
+
+			queryString := "INSERT INTO system_events (command, filename, funds, server, stock, timestamp, transaction_num, user_id)" +
+				" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+
+			timestamp := createTimestamp()
+
+			stmt, err := db.Prepare(queryString)
+			failOnError(err, "Failed to prepare system event log query")
+
+			res, err := stmt.Exec(req.Command, req.Filename, req.Funds, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
+			failOnError(err, "Failed to add system event log")
+
+			numrows, err := res.RowsAffected()
+			if numrows < 1 {
+				failOnError(err, "Failed to add system event log")
+			}
+		}
+	}()
+
+	log.Printf(" [*] Waiting for system events.")
+	<-forever
 }
 
-func logQuoteServerHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		TransactionNum  int
-		Server          string
-		Username        string
-		Stock           string
-		CryptoKey       string
-		QuoteServerTime int
-		Price           float64
-	}{0, "", "", "", "", 0, 0.0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse the request")
-
-	queryString := "INSERT INTO quote_server_events (crypto_key, price, quote_server_time, server, stock, timestamp, transaction_num, user_id)" +
-		" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-
-	timestamp := createTimestamp()
-
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare quote server event log query")
-
-	res, err := stmt.Exec(req.CryptoKey, req.Price, req.QuoteServerTime, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
-	failOnError(err, "Failed to add quote server event log")
-
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failOnError(err, "Failed to add quote server event log")
+func logQuoteServerHandler() {
+	conn, err := amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+	for err != nil {
+		conn, err = amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+		fmt.Println(err)
+		time.Sleep(time.Duration(5) * time.Second)
 	}
+	failOnError(err, "Failed to connect to RabbitMQ")
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		"qse", // name
+		false, // durable
+		false, // delete when usused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	failOnError(err, "Failed to register a consumer")
+
+	forever := make(chan bool)
+
+	go func() {
+		for d := range msgs {
+			req := struct {
+				TransactionNum  int
+				Server          string
+				Username        string
+				Stock           string
+				CryptoKey       string
+				QuoteServerTime int
+				Price           float64
+			}{0, "", "", "", "", 0, 0.0}
+			err := json.Unmarshal(d.Body, &req)
+			failOnError(err, "Failed to parse the request")
+
+			queryString := "INSERT INTO quote_server_events (crypto_key, price, quote_server_time, server, stock, timestamp, transaction_num, user_id)" +
+				" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+
+			timestamp := createTimestamp()
+
+			stmt, err := db.Prepare(queryString)
+			failOnError(err, "Failed to prepare quote server event log query")
+
+			res, err := stmt.Exec(req.CryptoKey, req.Price, req.QuoteServerTime, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
+			failOnError(err, "Failed to add quote server event log")
+
+			numrows, err := res.RowsAffected()
+			if numrows < 1 {
+				failOnError(err, "Failed to add quote server event log")
+			}
+		}
+	}()
+	log.Printf(" [*] Waiting for quote server events.")
+	<-forever
 }
 
-func logAccountTransactionHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		TransactionNum int
-		Server         string
-		Action         string
-		Username       string
-		Funds          float64
-	}{0, "", "", "", 0.0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse the request")
-
-	queryString := "INSERT INTO account_transactions (action, funds, server, timestamp, transaction_num, user_id)" +
-		" VALUES ($1, $2, $3, $4, $5, $6)"
-
-	timestamp := createTimestamp()
-
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare account transaction log query")
-
-	res, err := stmt.Exec(req.Action, req.Funds, req.Server, timestamp, req.TransactionNum, req.Username)
-	failOnError(err, "Failed to add account transaction log")
-
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failOnError(err, "Failed to add account transaction log")
+func logAccountTransactionHandler() {
+	conn, err := amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+	for err != nil {
+		conn, err = amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+		fmt.Println(err)
+		time.Sleep(time.Duration(5) * time.Second)
 	}
+	failOnError(err, "Failed to connect to RabbitMQ")
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		"at",  // name
+		false, // durable
+		false, // delete when usused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	failOnError(err, "Failed to register a consumer")
+
+	forever := make(chan bool)
+
+	go func() {
+		for d := range msgs {
+			req := struct {
+				TransactionNum int
+				Server         string
+				Action         string
+				Username       string
+				Funds          float64
+			}{0, "", "", "", 0.0}
+			err := json.Unmarshal(d.Body, &req)
+			failOnError(err, "Failed to parse the request")
+
+			queryString := "INSERT INTO account_transactions (action, funds, server, timestamp, transaction_num, user_id)" +
+				" VALUES ($1, $2, $3, $4, $5, $6)"
+
+			timestamp := createTimestamp()
+
+			stmt, err := db.Prepare(queryString)
+			failOnError(err, "Failed to prepare account transaction log query")
+
+			res, err := stmt.Exec(req.Action, req.Funds, req.Server, timestamp, req.TransactionNum, req.Username)
+			failOnError(err, "Failed to add account transaction log")
+
+			numrows, err := res.RowsAffected()
+			if numrows < 1 {
+				failOnError(err, "Failed to add account transaction log")
+			}
+		}
+	}()
+	log.Printf(" [*] Waiting for account transactions.")
+	<-forever
 }
 
-func logErrorEventHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		TransactionNum int
-		Server         string
-		Command        string
-		Username       string
-		Stock          string
-		Filename       string
-		ErrorMessage   string
-		Funds          float64
-	}{0, "", "", "", "", "", "", 0.0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse the request")
-
-	queryString := "INSERT INTO error_events (error_message, filename, funds, server, stock, timestamp, transaction_num, user_id)" +
-		" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-
-	timestamp := createTimestamp()
-
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare error events log query")
-
-	res, err := stmt.Exec(req.ErrorMessage, req.Filename, req.Funds, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
-	failOnError(err, "Failed to add error events log")
-
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failOnError(err, "Failed to add error events log")
+func logErrorEventHandler() {
+	conn, err := amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+	for err != nil {
+		conn, err = amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+		fmt.Println(err)
+		time.Sleep(time.Duration(5) * time.Second)
 	}
+	failOnError(err, "Failed to connect to RabbitMQ")
+	defer conn.Close()
+
+	ch, err := conn.Channel()
+	failOnError(err, "Failed to open a channel")
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare(
+		"ee",  // name
+		false, // durable
+		false, // delete when usused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	msgs, err := ch.Consume(
+		q.Name, // queue
+		"",     // consumer
+		true,   // auto-ack
+		false,  // exclusive
+		false,  // no-local
+		false,  // no-wait
+		nil,    // args
+	)
+	failOnError(err, "Failed to register a consumer")
+
+	forever := make(chan bool)
+
+	go func() {
+		for d := range msgs {
+			req := struct {
+				TransactionNum int
+				Server         string
+				Command        string
+				Username       string
+				Stock          string
+				Filename       string
+				ErrorMessage   string
+				Funds          float64
+			}{0, "", "", "", "", "", "", 0.0}
+			err := json.Unmarshal(d.Body, &req)
+
+			failOnError(err, "Failed to parse the request")
+
+			queryString := "INSERT INTO error_events (error_message, filename, funds, server, stock, timestamp, transaction_num, user_id)" +
+				" VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+
+			timestamp := createTimestamp()
+
+			stmt, err := db.Prepare(queryString)
+			failOnError(err, "Failed to prepare error events log query")
+
+			res, err := stmt.Exec(req.ErrorMessage, req.Filename, req.Funds, req.Server, req.Stock, timestamp, req.TransactionNum, req.Username)
+			failOnError(err, "Failed to add error events log")
+
+			numrows, err := res.RowsAffected()
+			if numrows < 1 {
+				failOnError(err, "Failed to add error events log")
+			}
+		}
+	}()
+	log.Printf(" [*] Waiting for error events.")
+	<-forever
 }
 
 func dumpLogHandler(w http.ResponseWriter, r *http.Request) {
@@ -365,7 +565,7 @@ func dumpLog(filename string, username string, isUser bool) {
 	rows, err := db.Query(queryString)
 	failOnError(err, "Failed to prepare query")
 	defer rows.Close()
-	
+
 	for rows.Next() {
 
 		logEvent := UserCommand{}
@@ -378,7 +578,7 @@ func dumpLog(filename string, username string, isUser bool) {
 		logs = append(logs, logEvent)
 	}
 
-	fmt.Println(len(logs))
+
 	// Get systemevents
 	queryString = "SELECT * FROM system_events" + userquery
 
@@ -479,12 +679,14 @@ func dumpLog(filename string, username string, isUser bool) {
 }
 
 func main() {
+	go logUserCommandHandler()
+	go logQuoteServerHandler()
+	go logAccountTransactionHandler()
+	go logSystemEventHandler()
+	go logErrorEventHandler()
+
 	port := ":8081"
-	http.HandleFunc("/logUserCommand", logUserCommandHandler)
-	http.HandleFunc("/logSystemEvent", logSystemEventHandler)
-	http.HandleFunc("/logQuoteServer", logQuoteServerHandler)
-	http.HandleFunc("/logAccountTransaction", logAccountTransactionHandler)
-	http.HandleFunc("/logErrorEvent", logErrorEventHandler)
+
 	http.HandleFunc("/dumpLog", dumpLogHandler)
 	http.HandleFunc("/dumpUserLog", dumpUserLogHandler)
 	http.ListenAndServe(port, nil)

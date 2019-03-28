@@ -12,6 +12,7 @@ import (
 	"strconv"
 
 	"net"
+
 	"github.com/go-redis/redis"
 	_ "github.com/herenow/go-crate"
 )
@@ -75,8 +76,7 @@ func SocketClient(symbol string, userID string) string {
 //
 func getQuote(symbol string, transactionNum int, userID string) float64 {
 	// Check if symbol is in cache
-        quote, err := cache.Get(symbol).Result()
-        
+	quote, err := cache.Get(symbol).Result()
 
 	if err == redis.Nil {
 
@@ -123,7 +123,7 @@ func getQuote(symbol string, transactionNum int, userID string) float64 {
 			return res.Quote
 		}
 	} else {
-		
+
 		// Otherwise, return the cached value
 		quote, err := strconv.ParseFloat(quote, 32)
 		failOnError(err, "Failed to parse float from quote")
