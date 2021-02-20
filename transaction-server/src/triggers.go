@@ -41,6 +41,7 @@ func fireTrigger(UserID string, Symbol string, method string) {
 
 	whereCond := "WHERE user_id = $1 AND symbol = $2"
 
+	var amount float64
 	var quantity int
 	// Get quantity of stock to buy/sell
 	queryString = "SELECT quantity FROM " + method + "_amounts " + whereCond
@@ -49,11 +50,13 @@ func fireTrigger(UserID string, Symbol string, method string) {
 		failGracefully(err, "Failed to prepare SELECT quantity query")
 		return
 	}
-	err = stmt.QueryRow(UserID, Symbol).Scan(&quantity)
+	err = stmt.QueryRow(UserID, Symbol).Scan(&amount)
 	if err != nil {
 		failGracefully(err, "Failed to get quantity from "+method+"_amounts")
 		return
 	}
+
+	quantity = int(amount / getQuote(Symbol, transactionNum, UserID))
 
 	// Delete buy/sell amount from user's account
 	queryString = "DELETE FROM " + method + "_amounts " + whereCond

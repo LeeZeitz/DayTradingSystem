@@ -1,8 +1,8 @@
 version: '3'
 services:
-  web:
+  nginx:
     build: 
-      context: web-server/
+      context: nginx/
       dockerfile: Dockerfile-local
     ports:
       - "8123:8123"
@@ -11,27 +11,31 @@ services:
       - DEBUG=TRUE
     depends_on:
       - transaction-db
+      - audit-mq
     build: 
       context: transaction-server/
       dockerfile: Dockerfile-local
     ports:
       - "8080:8080"
+    restart: on-failure
   transaction-db:
     build: 
-      context: transaction-server/crate/
+      context: transaction-server/postgres/
       dockerfile: Dockerfile-local
     ports:
-      - "4200:4200"
+      - "5432:5432"
     volumes:  
       - transaction-db:/data
   audit:
     depends_on:
       - audit-db
+      - audit-mq
     build: 
       context: audit-server/
       dockerfile: Dockerfile-local
     ports:
       - "8081:8081"
+    restart: on-failure
   audit-db:
     build: 
       context: audit-server/crate/
@@ -40,6 +44,11 @@ services:
       - "4201:4200"
     volumes:
       - audit-db:/data
+  audit-mq:
+    image: "rabbitmq:alpine" 
+    ports:
+      - "5672:5672"       
+      - "15672:15672"
   redis:
     image: redis:latest
     ports:

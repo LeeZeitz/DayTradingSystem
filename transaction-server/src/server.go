@@ -6,20 +6,30 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-redis/redis"
-	_ "github.com/herenow/go-crate"
+	_ "github.com/lib/pq"
+	"github.com/streadway/amqp"
+)
+
+const (
+	host   = "transaction-db"
+	port   = 5432
+	user   = "postgres"
+	dbname = "postgres"
 )
 
 var (
-	dbstring = func() string {
-		if runningInDocker() {
-			return "http://transaction-db:4200"
-		}
-		return "http://localhost:4200"
-	}()
+	//	dbstring = func() string {
+	//		if runningInDocker() {
+	//			return "http://transaction-db:4200"
+	//		}
+	//		return "http://localhost:4200"
+	//	}()
+
+	dbstring = fmt.Sprintf("host=%s port=%d user=%s dbname=%s sslmode=disable", host, port, user, dbname)
 
 	db = loadDb()
 
@@ -42,93 +52,16 @@ var (
 		Password: "",
 		DB:       0,
 	})
+	auditmq   *amqp.Channel
+	ucQueue   amqp.Queue
+	qseQueue  amqp.Queue
+	atQueue   amqp.Queue
+	seQueue   amqp.Queue
+	auditChan = make(chan interface{})
 )
 
-func logSystemEvent(transactionNum int, server string, command string, username string, stock string, filename string, funds float64) {
-	req := struct {
-		TransactionNum int
-		Server         string
-		Command        string
-		Username       string
-		Stock          string
-		Filename       string
-		Funds          float64
-	}{transactionNum, server, command, username, stock, "", funds}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logSystemEvent", "application/json; charset=utf-8", b)
-	if err != nil {
-
-		failGracefully(err, "Failed to log system event")
-	}
-	defer r.Body.Close()
-}
-
-func logUserCommand(transactionNum int, server string, command string, username string, stock string, filename string, funds float64) {
-	req := struct {
-		TransactionNum int
-		Server         string
-		Command        string
-		Username       string
-		Stock          string
-		Filename       string
-		Funds          float64
-	}{transactionNum, server, command, username, stock, "", funds}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logUserCommand", "application/json; charset=utf-8", b)
-
-	for err != nil {
-
-		r, err = http.Post(auditServer+"/logUserCommand", "application/json; charset=utf-8", b)
-
-		failGracefully(err, "Failed to log user command")
-	}
-	defer r.Body.Close()
-}
-
-func logAccountTransaction(transactionNum int, server string, action string, username string, funds float64) {
-	req := struct {
-		TransactionNum int
-		Server         string
-		Action         string
-		Username       string
-		Funds          float64
-	}{transactionNum, server, action, username, funds}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logAccountTransaction", "application/json; charset=utf-8", b)
-	if err != nil {
-
-		failGracefully(err, "Failed to log account transaction")
-	}
-
-	defer r.Body.Close()
-}
-
-func logQuoteServer(transactionNum int, server string, username string, stock string, cryptoKey string, quoteServerTime int64, price float64) {
-	req := struct {
-		TransactionNum  int
-		Server          string
-		Username        string
-		Stock           string
-		CryptoKey       string
-		QuoteServerTime int64
-		Price           float64
-	}{transactionNum, server, username, stock, cryptoKey, quoteServerTime, price}
-
-	b := new(bytes.Buffer)
-	json.NewEncoder(b).Encode(req)
-	r, err := http.Post(auditServer+"/logQuoteServer", "application/json; charset=utf-8", b)
-	if err != nil {
-
-		failGracefully(err, "Failed to log quote server event")
-	}
-
-	defer r.Body.Close()
+func createTimestamp() int64 {
+	return time.Now().UTC().UnixNano() / int64(time.Millisecond)
 }
 
 // Tested
@@ -147,7 +80,7 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 
 		failGracefully(err, "Failed to get add request")
 	}
-
+	fmt.Println(req.Amount)
 	logUserCommand(req.TransactionNum, "transaction-server", "ADD", req.UserID, "", "", req.Amount)
 
 	if req.Amount < 0 {
@@ -159,7 +92,7 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Insert new user if they don't already exist, otherwise update their balance
 	queryString := "INSERT INTO users (user_id, balance) VALUES ($1, $2)" +
-		"ON CONFLICT (user_id) DO UPDATE SET balance = balance + $2"
+		"ON CONFLICT (user_id) DO UPDATE SET balance = users.balance + $2"
 
 	stmt, err := db.Prepare(queryString)
 	if err != nil {
@@ -204,270 +137,6 @@ func quoteHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Tested
-func buyHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		UserID         string
-		Amount         float64 // dolar amount of a stock to buy
-		Symbol         string
-		TransactionNum int
-	}{"", 0.0, "", 0}
-
-	// Read request json data into struct
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse the request")
-
-	logUserCommand(req.TransactionNum, "transaction-server", "BUY", req.UserID, req.Symbol, "", req.Amount)
-
-	if req.Amount < 0 {
-		panic("Can't purchase a negative amount")
-	}
-
-	// Get price of requested stock
-	price := getQuote(req.Symbol, req.TransactionNum, req.UserID)
-	// Calculate total cost to buy given amount of given stock
-	buyNumber := int(req.Amount / price)
-	cost := float64(buyNumber) * price
-
-	// Query to get the current balance of the user
-	queryString := "SELECT balance FROM users WHERE user_id = $1;"
-	// Try to prepare query
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare query")
-
-	var balance float64
-
-	// Try to perform the query and get the user's balance
-	// TODO: this should probably handle a user buy when the user doesn't exist, but it doesn't right now.
-	err = stmt.QueryRow(req.UserID).Scan(&balance)
-	failOnError(err, "Failed to get user balance")
-	defer stmt.Close()
-
-	// Check user balance against cost of requested stock purchase
-	if balance >= cost {
-		// User has enough, reserve the funds by pulling them from the account
-		queryString = "UPDATE users SET balance = balance - $1 WHERE user_id = $2"
-		stmt, err := db.Prepare(queryString)
-		failOnError(err, "Failed to prepare withdraw query")
-
-		// Withdraw funds from user's account
-		res, err := stmt.Exec(cost, req.UserID)
-		failOnError(err, "Failed to withdraw money from user account")
-
-		numrows, err := res.RowsAffected()
-		if numrows < 1 {
-			failOnError(err, "Failed to reserve funds")
-		}
-		// Add buy transaction to front of user's transaction list
-		cache.LPush(req.UserID+":buy", req.Symbol+":"+strconv.Itoa(buyNumber))
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-// Tested
-func commitBuyHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		UserID         string
-		TransactionNum int
-	}{"", 0}
-
-	// Parse request parameters into struct (just user_id)
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse request")
-
-	logUserCommand(req.TransactionNum, "transaction-server", "COMMIT_BUY", req.UserID, "", "", 0.0)
-
-	// Get most recent buy transaction
-	task := cache.LPop(req.UserID + ":buy")
-	tasks := strings.Split(task.Val(), ":")
-
-	// Check if there are any buy transactions to perform
-	if len(tasks) <= 1 {
-		w.Write([]byte("Failed to commit buy transaction: no buy orders exist"))
-		return
-	}
-
-	// Add new stocks to user's account
-	buyStock(req.UserID, tasks[0], tasks[1], req.TransactionNum)
-	w.WriteHeader(http.StatusOK)
-}
-
-func buyStock(UserID string, Symbol string, quantity string, transactionNum int) {
-	// Add new stocks to user's account
-	queryString := "INSERT INTO stocks (quantity, symbol, user_id) VALUES ($1, $2, $3) " +
-		"ON CONFLICT (user_id, symbol) DO UPDATE SET quantity = quantity + $1;"
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare query")
-	res, err := stmt.Exec(quantity, Symbol, UserID)
-	failGracefully(err, "Failed to add stocks to account")
-
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failGracefully(err, "Failed to add stocks to account")
-	}
-
-	f, err := strconv.ParseFloat(quantity, 64)
-	failOnError(err, "Failed to parse float")
-	logAccountTransaction(transactionNum, "transaction-server", "BUY", UserID, f) // todo add transnum
-}
-
-// Tested
-func cancelBuyHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		UserID         string
-		TransactionNum int
-	}{"", 0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse request")
-
-	cache.LPop(req.UserID + ":buy")
-
-	logUserCommand(req.TransactionNum, "transaction-server", "CANCEL_BUY", req.UserID, "", "", 0.0)
-	w.WriteHeader(http.StatusOK)
-}
-
-// Tested
-func sellHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		UserID         string
-		Amount         float64 // Dollar value to sell
-		Symbol         string
-		TransactionNum int
-	}{"", 0.0, "", 0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse request")
-	logUserCommand(req.TransactionNum, "transaction-server", "SELL", req.UserID, req.Symbol, "", req.Amount)
-
-	price := getQuote(req.Symbol, req.TransactionNum, req.UserID)
-
-	// Calculate the number of the stock to sell
-	sellNumber := int(req.Amount / price)
-	salePrice := price * float64(sellNumber)
-
-	// TODO: Should handle an attempted sale of unowned stocks
-	// Check that the user has enough stocks to sell
-	queryString := "SELECT quantity FROM stocks WHERE user_id = $1 and symbol = $2"
-
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare query")
-
-	// Number of given stock owned by user
-	var balance int
-	err = stmt.QueryRow(req.UserID, req.Symbol).Scan(&balance)
-	defer stmt.Close()
-
-	if err != nil {
-		//fmt.Println("Failed to retrieve number of given stock owned by user")
-		w.Write([]byte("Failed to retrieve number of given stock owned by user"))
-		return
-	}
-
-	// Check if the user has enough
-	if balance >= sellNumber {
-		queryString = "UPDATE stocks SET quantity = quantity - $1 where user_id = $2 and symbol = $3;"
-		stmt, err = db.Prepare(queryString)
-		failOnError(err, "Failed to prepare query")
-
-		// Withdraw the stocks to sell from user's account
-		res, err := stmt.Exec(sellNumber, req.UserID, req.Symbol)
-		failOnError(err, "Failed to reserve stocks to sell")
-
-		numrows, err := res.RowsAffected()
-		if numrows < 1 {
-			failOnError(err, "Failed to reserve stocks to sell")
-		}
-		fmt.Println(salePrice)
-		cache.LPush(req.UserID+":sell", req.Symbol+":"+strconv.FormatFloat(salePrice, 'f', -1, 64))
-	}
-	w.WriteHeader(http.StatusOK)
-}
-
-// Tested
-func commitSellHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		UserID         string
-		TransactionNum int
-	}{"", 0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse request")
-
-	logUserCommand(req.TransactionNum, "transaction-server", "COMMIT_SELL", req.UserID, "", "", 0.0)
-
-	task := cache.LPop(req.UserID + ":sell")
-	tasks := strings.Split(task.Val(), ":")
-
-	if len(tasks) <= 1 {
-		w.Write([]byte("Failed to commit sell transaction: no sell orders exist"))
-		return
-	}
-
-	queryString := "UPDATE users SET balance = balance + $1 WHERE user_id = $2;"
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare query")
-	res, err := stmt.Exec(tasks[1], req.UserID)
-	failOnError(err, "Failed to refund money for stock sale")
-
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failGracefully(err, "Failed to refund money for stock sale")
-		return
-	}
-	w.WriteHeader(http.StatusOK)
-
-}
-
-func sellStock(UserID string, Symbol string, quantity string, transactionNum int) {
-	f, err := strconv.ParseFloat(quantity, 64)
-	failOnError(err, "Failed to parse float")
-	logAccountTransaction(transactionNum, "transaction-server", "SELL", UserID, f)
-
-	queryString := "UPDATE stocks SET quantity = quantity - $1 where user_id = $2 and symbol = $3;"
-	stmt, err := db.Prepare(queryString)
-	failOnError(err, "Failed to prepare query")
-
-	// Withdraw the stocks to sell from user's account
-	res, err := stmt.Exec(quantity, UserID, Symbol)
-	if err != nil {
-		fmt.Println("Failed to reserve stocks to sell")
-		return
-	}
-	numrows, err := res.RowsAffected()
-	if numrows < 1 {
-		failGracefully(err, "Failed to reserve stocks to sell")
-	}
-}
-
-// Tested
-func cancelSellHandler(w http.ResponseWriter, r *http.Request) {
-	decoder := json.NewDecoder(r.Body)
-
-	req := struct {
-		UserID         string
-		TransactionNum int
-	}{"", 0}
-
-	err := decoder.Decode(&req)
-	failOnError(err, "Failed to parse request")
-
-	logUserCommand(req.TransactionNum, "transaction-server", "CANCEL_SELL", req.UserID, "", "", 0.0)
-
-	cache.LPop(req.UserID + ":sell")
-	w.WriteHeader(http.StatusOK)
-}
-
-// Tested
 func setBuyAmountHandler(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 
@@ -486,7 +155,7 @@ func setBuyAmountHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Add buy amount to user's account. If a buy amount already exists for the requested stock, add this to it
 	queryString := "INSERT INTO buy_amounts (user_id, symbol, quantity) VALUES ($1, $2, $3) " +
-		"ON CONFLICT (user_id, symbol) DO UPDATE SET quantity = quantity + $3;"
+		"ON CONFLICT (user_id, symbol) DO UPDATE SET quantity = buy_amounts.quantity + $3;"
 
 	stmt, err := db.Prepare(queryString)
 	failOnError(err, "Failed to prepare query")
@@ -602,7 +271,7 @@ func setSellAmountHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Add buy amount to user's account. If a buy amount already exists for the requested stock, add this to it
 	queryString := "INSERT INTO sell_amounts (user_id, symbol, quantity) VALUES ($1, $2, $3) " +
-		"ON CONFLICT (user_id, symbol) DO UPDATE SET quantity = quantity + $3;"
+		"ON CONFLICT (user_id, symbol) DO UPDATE SET quantity = sell_amounts.quantity + $3;"
 
 	stmt, err := db.Prepare(queryString)
 	failOnError(err, "Failed to prepare query")
@@ -797,7 +466,93 @@ func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Origin", "*")
 }
 
+func audit(audits <-chan interface{}) {
+	channelName := ""
+	for audit := range audits {
+
+		switch audit.(type) {
+		case UserCommand:
+			channelName = "uc"
+		case AccountTransaction:
+			channelName = "at"
+		case QuoteServerEvent:
+			channelName = "qse"
+		case SystemEvent:
+			channelName = "se"
+		}
+		body, err := json.Marshal(audit)
+		failOnError(err, "Failed to marshall data")
+		err = auditmq.Publish(
+			"",          // exchange
+			channelName, // routing key
+			false,       // mandatory
+			false,       // immediate
+			amqp.Publishing{
+				ContentType:     "application/json",
+				ContentEncoding: "",
+				Body:            []byte(body),
+			})
+		failOnError(err, "Failed to publish a "+channelName+" message")
+	}
+}
+
+func initRabbit() {
+	conn, err := amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+	for err != nil {
+		conn, err = amqp.Dial("amqp://guest:guest@audit-mq:5672/")
+		fmt.Println(err)
+		time.Sleep(time.Duration(5) * time.Second)
+	}
+	failOnError(err, "Failed to connect to RabbitMQ")
+
+	auditmq, err = conn.Channel()
+	failOnError(err, "Failed to open a channel")
+
+	ucQueue, err = auditmq.QueueDeclare(
+		"uc",  // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	qseQueue, err = auditmq.QueueDeclare(
+		"qse", // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	seQueue, err = auditmq.QueueDeclare(
+		"se",  // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+
+	atQueue, err = auditmq.QueueDeclare(
+		"at",  // name
+		false, // durable
+		false, // delete when unused
+		false, // exclusive
+		false, // no-wait
+		nil,   // arguments
+	)
+	failOnError(err, "Failed to declare a queue")
+}
+
 func main() {
+	initRabbit()
+	defer auditmq.Close()
+	go audit(auditChan)
 	port := ":8080"
 	http.HandleFunc("/add", addHandler)
 	http.HandleFunc("/quote", quoteHandler)
